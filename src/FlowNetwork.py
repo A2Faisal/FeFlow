@@ -361,9 +361,15 @@ class FlowNetwork:
 
 		return adjusted_distances
 
-	def _scatterplot(self, df, x_col, y_col, x_log=False, y_log=False, title="Recorded vs Modelled Trade", x_label="Recorded Trade", y_label="Modelled Trade", fontsize=12, xmax=None, ymax=None, rm_outliers=False, output_dir=None, filename=None, ax=None):
+	def _scatterplot(
+		self, df, x_col, y_col, x_log=False, y_log=False,
+		title="Recorded vs Modelled Trade", x_label="Recorded Trade", y_label="Modelled Trade",
+		fontsize=12, xmax=None, ymax=None, rm_outliers=False,
+		ax=None, scatter_color="navy"  # default nature-style green
+	):
 		df_copy = df.dropna(subset=[x_col, y_col, "ISO3"]).copy()
 
+		# --- Prepare plotting values ---
 		if x_log:
 			df_copy = df_copy[df_copy[x_col] > 0]
 			df_copy["x_plot"] = np.log10(df_copy[x_col])
@@ -376,11 +382,11 @@ class FlowNetwork:
 		else:
 			df_copy["y_plot"] = df_copy[y_col]
 
+		# --- Remove outliers ---
 		if rm_outliers:
 			Q1_x, Q3_x = df_copy["x_plot"].quantile([0.25, 0.75])
 			Q1_y, Q3_y = df_copy["y_plot"].quantile([0.25, 0.75])
 			IQR_x, IQR_y = Q3_x - Q1_x, Q3_y - Q1_y
-
 			df_copy = df_copy[
 				(df_copy["x_plot"] >= Q1_x - 1.5 * IQR_x) & (df_copy["x_plot"] <= Q3_x + 1.5 * IQR_x) &
 				(df_copy["y_plot"] >= Q1_y - 1.5 * IQR_y) & (df_copy["y_plot"] <= Q3_y + 1.5 * IQR_y)
@@ -393,55 +399,66 @@ class FlowNetwork:
 			slope, intercept = np.polyfit(x_vals, y_vals, 1)
 			y_pred = slope * x_vals + intercept
 
-			# Metrics
+			# R²
 			r2 = 1 - np.sum((y_vals - y_pred)**2) / np.sum((y_vals - np.mean(y_vals))**2)
-			rmse = np.sqrt(np.mean((y_vals - x_vals)**2))
-			mae = np.mean(np.abs(y_vals - x_vals))
-			nrmse = rmse / np.mean(x_vals)
-			mape = np.mean(np.abs((y_vals - x_vals) / x_vals)) * 100
-			smape = np.mean(2 * np.abs(y_vals - x_vals) / (np.abs(x_vals) + np.abs(y_vals))) * 100
+
+			if x_log or y_log:
+				# Log-space metrics
+				x_true = df_copy[x_col].values
+				y_true = df_copy[y_col].values
+				mask = (x_true > 0) & (y_true > 0)
+				x_true = x_true[mask]
+				y_true = y_true[mask]
+
+				rmsle = np.sqrt(np.mean((np.log10(y_true) - np.log10(x_true))**2))
+				male = np.median(np.abs(np.log10(y_true) - np.log10(x_true)))
+
+				metrics_text = (
+					f"$R^2$ = {r2:.2f}\n"
+					f"RMSLE = {rmsle:.2f}\n"
+					f"MALE = {male:.2f}"
+				)
+
+				residuals = np.log10(y_true) - np.log10(x_true)
+			else:
+				# Linear-space metrics
+				rmse = np.sqrt(np.mean((y_vals - x_vals)**2))
+				mean_error = np.mean(y_vals - x_vals)
+
+				metrics_text = (
+					f"$R^2$ = {r2:.2f}\n"
+					f"RMSE = {rmse:.2f}\n"
+					f"Mean Error = {mean_error:.2f}"
+				)
+
+				residuals = y_vals - x_vals
+
+			std_residual = np.std(residuals)
+			ci = 1.96 * std_residual
 		else:
-			r2 = rmse = mae = nrmse = mape = smape = np.nan
+			r2 = ci = np.nan
+			metrics_text = "Not enough points"
+			residuals = np.array([])
 
-		# Compute residuals and CI
-		residuals = y_vals - x_vals
-		std_residual = np.std(residuals)
-		ci = 1.96 * std_residual
-
-		# Define the 1:1 line
-		min_val = min(x_vals.min(), y_vals.min())
-		max_val = max(x_vals.max(), y_vals.max())
+		# 1:1 line
+		min_val = min(x_vals.min(), y_vals.min()) if len(x_vals) > 0 else 0
+		max_val = max(x_vals.max(), y_vals.max()) if len(x_vals) > 0 else 1
 		x_line = np.array([min_val, max_val])
 		y_line = x_line
 
-		# --- Plot section ---
-		# Create new figure if ax not supplied
 		if ax is None:
 			fig, ax = plt.subplots(figsize=(7, 7))
 		else:
 			fig = None
-		ax.scatter(x_vals, y_vals, alpha=0.6, s=25)
+
+		ax.scatter(x_vals, y_vals, alpha=0.6, s=25, color=scatter_color)
 		ax.plot(x_line, y_line, 'b--', label='1-to-1 line')
-		ax.plot(x_line, y_line + ci, 'r--', label='95% Error Band')
+		ax.plot(x_line, y_line + ci, 'r--', label='95% CI')
 		ax.plot(x_line, y_line - ci, 'r--')
 
-		# Annotate points outside the CI
-		# for i in range(len(df_copy)):
-		# 	if abs(residuals[i]) > ci:
-		# 		ax.annotate(df_copy["ISO3"].iloc[i],
-		# 					(x_vals[i], y_vals[i]),
-		# 					fontsize=10,
-		# 					alpha=0.8)
-
-		# Annotate statistics
 		ax.text(
 			0.05, 0.95,
-			f"$R^2$ = {r2:.2f}\n"
-			f"RMSE = {rmse:.2f}\n"
-			f"NRMSE = {nrmse:.2%}\n"
-			f"MAE = {mae:.2f}\n"
-			f"MAPE = {mape:.2f}%\n"
-			f"sMAPE = {smape:.2f}%",
+			metrics_text,
 			transform=ax.transAxes,
 			fontsize=fontsize,
 			verticalalignment='top',
@@ -459,33 +476,20 @@ class FlowNetwork:
 		if ymax is not None:
 			ax.set_ylim(top=ymax)
 		ax.set_aspect('equal', adjustable='box')
+		ax.grid(False)
 		plt.tight_layout()
 
-		# --- Save ---
-		# Save only if we created the figure here
-		if fig is not None and (output_dir or filename):
-			filename = filename or "model_validation.png"
-			root, ext = os.path.splitext(filename)
-			if not ext:
-				ext = ".png"
-				filename = root + ext
-			save_path = os.path.join(output_dir if output_dir else os.getcwd(), filename)
-			plt.savefig(save_path, dpi=600, bbox_inches='tight', format=ext.lstrip('.'))
-			plt.show()
-			plt.close(fig)
-
-		# Pack up the stats
 		stats = {
-			"R2":     r2,
-			"RMSE":   rmse,
-			"NRMSE":  nrmse,
-			"MAE":    mae,
-			"MAPE":   mape,
-			"sMAPE":  smape,
+			"R2": r2,
+			"RMSLE": rmsle if (x_log or y_log) else np.nan,
+			"MALE": male if (x_log or y_log) else np.nan,
+			"RMSE": rmse if not (x_log or y_log) else np.nan,
+			"MeanError": mean_error if not (x_log or y_log) else np.nan,
 			"n_points": len(x_vals)
 		}
-		return stats
-		
+
+		return stats, fig
+	
 	## Algorithm Methods ##
 
 	def gravity_model(self, distance='pairwise_haversine', threshold_percentile=100, trade_tariff_path=None, year=None, mode='exponential', tariff_weight_factor=1.0, alpha=1.0, a=2.0, b=10, c=0.3, verbose=False):
@@ -663,7 +667,7 @@ class FlowNetwork:
 		self.bilateral_df = trade_df.copy()
 		return self.bilateral_df
 
-	def validate_bilateral(self, bilateral_csv_path, year, column='tonnes', x_log=False, y_log=False, rm_outliers=False, title="Recorded vs Modelled Trade", x_label="Recorded", y_label="Modelled", xmax=None, ymax=None, fontsize=12):
+	def validate_bilateral(self, bilateral_csv_path, year, column='tonnes', x_log=False, y_log=False, rm_outliers=False, title="Recorded vs Modelled Trade", x_label="Recorded", y_label="Modelled", xmax=None, ymax=None, fontsize=12, output_dir=None, filename=None):
 		raw_df = pd.read_csv(bilateral_csv_path)
 		raw_df = raw_df[raw_df["year"] == year]
 		self.year = year
@@ -683,7 +687,7 @@ class FlowNetwork:
 		val_df['ISO3'] = val_df['exp_ISO3'] + '→' + val_df['imp_ISO3']
 		self.val_df = val_df
 		# 5) plot
-		metrics = self._scatterplot(
+		metrics, fig = self._scatterplot(
 			val_df,
 			x_col='raw_tonnes',
 			y_col='pred_tonnes',
@@ -697,6 +701,18 @@ class FlowNetwork:
 			ymax=ymax,
 			fontsize=fontsize
 		)
+		    # Save figure
+		if output_dir or filename:
+			filename = filename or f"trade_validation_{year}.png"
+			root, ext = os.path.splitext(filename)
+			if not ext:
+				ext = ".png"
+				filename = root + ext
+			save_path = os.path.join(output_dir if output_dir else os.getcwd(), filename)
+			fig.savefig(save_path, dpi=600, bbox_inches='tight', format=ext.lstrip('.'))
+
+		plt.show()
+		plt.close(fig)
 		df_metrics = pd.DataFrame([metrics])
 		df_metrics['Year'] = year
 		self.df_metrics = df_metrics
@@ -960,7 +976,9 @@ class FlowNetwork:
 		# Define bins and styles
 		bins = bins
 		labels = labels
-		sizes = [radius**(2*i) for i in range(len(labels))]
+		# sizes = [radius**(2*i) for i in range(len(labels))]
+		sizes = [radius * (i+1)**3 for i in range(len(labels))]
+
 		colors = [color] * len(labels)  # same border color
 
 		# Assign classes
@@ -1061,21 +1079,17 @@ class FlowNetwork:
 		# Save and show
 		plt.tight_layout()
 		if output_dir or filename:
-			# Default filename if none provided
 			filename = filename or "network_plot.png"
-			
-			# Check for file extension
 			root, ext = os.path.splitext(filename)
 			if not ext:
-				ext = ".png"  # default to PNG if no extension provided
+				ext = ".png"
 				filename = root + ext
-
-			# Construct full save path
 			save_path = os.path.join(output_dir if output_dir else os.getcwd(), filename)
-
-			# Save figure using detected or default format
-			plt.savefig(save_path, dpi=600, bbox_inches='tight', format=ext.lstrip('.'))
+			fig.savefig(save_path, dpi=600, bbox_inches='tight', format=ext.lstrip('.'))
+			print(f"Map saved at: {save_path}")
+   
 		plt.show()
+		plt.close(fig)
 
 	def compute_marginal_country_trade(self, out_path=None, verbose=False):
 		"""
