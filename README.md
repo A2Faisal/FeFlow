@@ -21,3 +21,6 @@ This repository contains the data, source code, Jupyter notebooks, and outputs u
 
 - All files required to reproduce the figures and results in the manuscript are included.  
 - Python and Jupyter are required to run the notebooks.  
+
+## Contact
+For questions or inquiries about this project, please contact [abdullah-al.faisal@mail.mcgill.ca](mailto:abdullah-al.faisal@mail.mcgill.ca) or [maxwell.kaye@mail.mcgill.ca](mailto:maxwell.kaye@mail.mcgill.ca).
