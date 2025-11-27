@@ -7,6 +7,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.colors as mcolors
 from haversine import haversine
+from pyproj import Geod
 import json
 import importlib.resources as pkg_resources
 import os
@@ -957,7 +958,7 @@ class FlowNetwork:
 
 	### Plot map
 	# Mass Displacement Plot Function
-	def _mass_displacement_plot(self, title="", radius=3, color="darkblue", bins=[0.1, 15, 30, 60, 100, np.inf], labels=['0–15', '15–30', '30–60', '60–100', '>100']):
+	def _mass_displacement_plot(self, title="", radius=3, color="darkblue", bins=[0.1, 15, 30, 60, 100, np.inf], labels=['0–15', '15–30', '30–60', '60–100', '>100'], central_longitude=0):
 		# Prepare data
 		ds = self.mass_displacement()
 		lat_vals = ds['lat'].values
@@ -986,7 +987,7 @@ class FlowNetwork:
 
 		# Plot
 		fig = plt.figure(figsize=(12, 8))
-		ax = plt.axes(projection=ccrs.Robinson())
+		ax = plt.axes(projection=ccrs.Robinson(central_longitude=central_longitude))
 		ax.set_global()
 		ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
 		# ax.add_feature(cfeature.BORDERS, linewidth=0.5)
@@ -1003,39 +1004,99 @@ class FlowNetwork:
 					edgecolors=colors[i],
 					label=labels[i],
 					alpha=0.2 if i == 0 else 1,
-					transform=ccrs.PlateCarree()
+					# transform=ccrs.PlateCarree(),
+					transform=ccrs.Geodetic(),
+					zorder=3
 				)
 
 		# Legend and title
-		plt.legend(title="Mass Displacement\n(Gt-km)", title_fontsize=14, loc='center left', frameon=False, fontsize=14)
+		plt.legend(title="Mass Displacement\n(Gt·km)", title_fontsize=14, loc='center left', frameon=False,  bbox_to_anchor=(1, 0.5), fontsize=14)
 		plt.title(title, fontsize=18)
 		
 		return fig, ax
 
-	# Flow Overlay Function
-	def _plot_flow_network_gradient(self, ax, num_edges=1000, edge_alpha=0.6, edge_cmap="magma", steps=20):
+	def _plot_flow_network_gradient(
+		self, ax,
+		num_edges=None,             # number of top edges
+		coverage=None,              # fraction of total flow, e.g. 0.9 for 90%
+		edge_alpha=0.6,
+		edge_cmap="magma",
+		steps=20
+	):
 		ds_flow = self._gridded_inflow_outflow()
 		flow = ds_flow["flow"].values
 		origin_coords = list(zip(ds_flow["origin_lat"].values, ds_flow["origin_lon"].values))
 		destination_coords = list(zip(ds_flow["destination_lat"].values, ds_flow["destination_lon"].values))
 
+		# Replace NaNs or infs with zeros
 		flow_clean = np.where(np.isfinite(flow), flow, 0)
+		total_flow = flow_clean.sum()
 
-		flat_indices = np.argpartition(flow_clean.ravel(), -num_edges)[-num_edges:]
-		top_indices = flat_indices[np.argsort(flow_clean.ravel()[flat_indices])][::-1]
+		# Flatten and sort all flows descendingly
+		flat_flow = flow_clean.ravel()
+		sorted_indices = np.argsort(flat_flow)[::-1]
+		sorted_flows = flat_flow[sorted_indices]
+
+		# ---- Determine selection method ----
+		if (num_edges is None) and (coverage is None):
+			raise ValueError("Specify either 'num_edges' or 'coverage' (e.g. coverage=0.9 for top 90% of flow).")
+		if (num_edges is not None) and (coverage is not None):
+			raise ValueError("Specify only one of 'num_edges' or 'coverage', not both.")
+
+		# (a) Top N edges
+		if num_edges is not None:
+			top_indices = sorted_indices[:num_edges]
+			top_flows = sorted_flows[:num_edges]
+			coverage_percent = (top_flows.sum() / total_flow) * 100
+			print(f"Top {num_edges:,} edges cover {coverage_percent:.2f}% of total flow.")
+
+		# (b) Top X% flow coverage
+		else:
+			cumulative_flow = np.cumsum(sorted_flows)
+			threshold_idx = np.searchsorted(cumulative_flow, coverage * total_flow)
+			top_indices = sorted_indices[:threshold_idx + 1]
+			top_flows = sorted_flows[:threshold_idx + 1]
+			coverage_percent = (top_flows.sum() / total_flow) * 100
+			print(f"Top {coverage_percent:.2f}% of flow includes {len(top_flows):,} edges.")
+
+		# Map indices back to 2D positions
 		out_idxs, in_idxs = np.unravel_index(top_indices, flow.shape)
-
 		flow_vals = flow_clean[out_idxs, in_idxs]
+
+		# ---- Normalization and colormap ----
 		norm = mcolors.Normalize(vmin=flow_vals.min(), vmax=flow_vals.max())
 		cmap = plt.get_cmap(edge_cmap)
 
-		# ---- Calculate coverage of top edges ----
-		total_flow = flow_clean.sum()
-		top_flow_sum = flow_vals.sum()
-		coverage_percent = (top_flow_sum / total_flow) * 100
-		print(f"Top {num_edges:,} edges cover {coverage_percent:.2f}% of total flow.")
+		scale_factor = 1
+		# scale_factor = 68603 / 287529 # for s2
+		min_width = 0.01 * scale_factor
+		max_width = 0.1 * scale_factor
 
-		min_width, max_width = 0.2, 3
+		# # ---- Plot ----
+		# for out_i, in_j, val in zip(out_idxs, in_idxs, flow_vals):
+		# 	if val <= 0:
+		# 		continue
+		# 	lat1, lon1 = origin_coords[out_i]
+		# 	lat2, lon2 = destination_coords[in_j]
+		# 	width = min_width + (max_width - min_width) * norm(val)
+
+		# 	lats = np.linspace(lat1, lat2, steps)
+		# 	lons = np.linspace(lon1, lon2, steps)
+
+		# 	for i in range(steps - 1):
+		# 		color = cmap(i / (steps - 1))
+		# 		ax.plot(
+		# 			[lons[i], lons[i+1]], [lats[i], lats[i+1]],
+		# 			color=color,
+		# 			linewidth=width,
+		# 			alpha=edge_alpha,
+		# 			# transform=ccrs.PlateCarree(),
+		# 			transform=ccrs.Geodetic(),
+		# 			zorder=2
+		# 		)
+
+		# ---- Plot ----
+		geod = Geod(ellps="WGS84")
 
 		for out_i, in_j, val in zip(out_idxs, in_idxs, flow_vals):
 			if val <= 0:
@@ -1044,33 +1105,40 @@ class FlowNetwork:
 			lat2, lon2 = destination_coords[in_j]
 			width = min_width + (max_width - min_width) * norm(val)
 
-			lats = np.linspace(lat1, lat2, steps)
-			lons = np.linspace(lon1, lon2, steps)
+			# geodesic points
+			pts = geod.npts(lon1, lat1, lon2, lat2, steps-2)  # returns list of (lon, lat) tuples
+			lons_pts = [lon1] + [p[0] for p in pts] + [lon2]
+			lats_pts = [lat1] + [p[1] for p in pts] + [lat2]
 
-			for i in range(steps - 1):
-				color = cmap(i / (steps - 1))
+			# draw each segment with gradient
+			for k in range(len(lons_pts)-1):
+				color = plt.get_cmap(edge_cmap)(k / (len(lons_pts)-1))
 				ax.plot(
-					[lons[i], lons[i+1]], [lats[i], lats[i+1]],
+					[lons_pts[k], lons_pts[k+1]],
+					[lats_pts[k], lats_pts[k+1]],
 					color=color,
 					linewidth=width,
 					alpha=edge_alpha,
-					transform=ccrs.Geodetic()
+					transform=ccrs.Geodetic(),
+					zorder=2
 				)
 
 	# Main plotting function
-	def plot_network_map(self, title="", radius=3, color="darkblue", bins=[0.1, 15, 30, 60, 100, np.inf], labels=['0–15', '15–30', '30–60', '60–100', '>100'], num_edges=1000, edge_alpha=0.6, edge_cmap="magma", steps=20, output_dir=None, filename=None):
+	def plot_network_map(self, title="", radius=3, color="darkblue", bins=[0.1, 15, 30, 60, 100, np.inf], labels=['0–15', '15–30', '30–60', '60–100', '>100'], num_edges=None, coverage=None, edge_alpha=0.6, edge_cmap="magma", steps=20, output_dir=None, filename=None, central_longitude=0):
 		# Plot both on same figure
 		fig, ax = self._mass_displacement_plot(
 			title=title,
 			radius=radius,
 			color=color,
 			bins=bins,
-			labels = labels
+			labels=labels,
+			central_longitude=central_longitude 
 		)
 
 		self._plot_flow_network_gradient(
 			ax=ax,
 			num_edges=num_edges,
+			coverage=coverage,
 			edge_alpha=edge_alpha,
 			edge_cmap=edge_cmap,
 			steps=steps
@@ -1090,7 +1158,121 @@ class FlowNetwork:
    
 		plt.show()
 		plt.close(fig)
+	
+	# historam 
+	def plot_flow_histogram(self, min_flow_threshold=0.001, figsize=(12, 5)):
+		"""
+		Nature-style composite plot showing physically meaningful flow distribution
+		and mass concentration characteristics.
+		
+		Parameters
+		----------
+		min_flow_threshold : float
+			Minimum physically meaningful flow in tons (default 0.001 = 1 kg)
+		figsize : tuple
+			Figure size
+		"""
+		# Load and prepare data
+		ds_flow = self._gridded_inflow_outflow()
+		flow = ds_flow["flow"].values
+		flow_clean = np.where(np.isfinite(flow), flow, np.nan)
+		
+		# Flatten and remove NaNs, keep only positive flows
+		vals = flow_clean.reshape(-1)
+		vals = vals[~np.isnan(vals)]
+		vals_pos = vals[vals > 0]
+		
+		if len(vals_pos) == 0:
+			raise ValueError("No positive flow values found.")
+		
+		# Apply physical threshold - ignore numerically tiny flows
+		vals_physical = vals_pos[vals_pos >= min_flow_threshold]
+		
+		# Calculate mass concentration statistics
+		sorted_vals = np.sort(vals_physical)[::-1]  # Largest first
+		cumulative_mass = np.cumsum(sorted_vals) / np.sum(sorted_vals)
+		
+		# Find the 80% mass threshold point
+		idx_80 = np.searchsorted(cumulative_mass, 0.8)
+		n_connections_80 = idx_80 + 1
+		total_connections = len(vals_physical)
+		percent_connections = (n_connections_80 / total_connections) * 100
+		
+		# Create figure
+		fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+		
+		# Left panel: Flow size distribution (log bins)
+		bins = np.logspace(np.log10(vals_physical.min()), 
+						np.log10(vals_physical.max()), 50)
+		
+		counts, _, _ = ax1.hist(vals_physical, bins=bins, 
+							color='steelblue', edgecolor='white', 
+							alpha=0.8, linewidth=0.5)
+		ax1.set_xscale('log')
+		ax1.set_xlim(1e-20, None)
+		ax1.set_xlabel('Flow Magnitude [tonnes]', fontsize=12, labelpad=10)
+		ax1.set_ylabel('Number of Edges', fontsize=12, labelpad=10)
+		ax1.set_title('Distribution of Iron Flows', 
+					fontsize=13, pad=15)
+		ax1.grid(True, alpha=0.3, which='both')
+		ax1.tick_params(axis='both', which='major', labelsize=10)
+		
+		# Add annotation about physical threshold
+		# ax1.annotate(f'Physical threshold: {min_flow_threshold} tons\n'
+		# 			f'({total_connections:,} total connections)',
+		# 			xy=(0.05, 0.95), xycoords='axes fraction',
+		# 			bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
+		# 			ha='left', va='top', fontsize=9)
+		
+		# Right panel: Mass concentration (cumulative distribution)
+		ax2.plot(range(1, len(cumulative_mass) + 1), cumulative_mass, 
+				color='crimson', linewidth=2.5, alpha=0.8)
+		ax2.set_xscale('log')
+		ax2.set_xlabel('Number of Edges (Ranked by Flow Size)', 
+					fontsize=12, labelpad=10)
+		ax2.set_ylabel('Cumulative Mass Fraction', fontsize=12, labelpad=10)
+		ax2.set_title('Mass Concentration in Global Iron Trade', 
+					fontsize=13, pad=15)
+		ax2.grid(True, alpha=0.3)
+		ax2.set_ylim(0, 1.05)
+		ax2.tick_params(axis='both', which='major', labelsize=10)
+		
+		# Add the 80% mass annotation
+		ax2.axhline(y=0.8, color='black', linestyle='--', alpha=0.7, linewidth=1)
+		ax2.axvline(x=n_connections_80, color='black', linestyle='--', alpha=0.7, linewidth=1)
+		
+		ax2.annotate(f'{percent_connections:.1f}% of edges\n'
+					f'carry 80% of total mass\n'
+					f'({n_connections_80:,} of {total_connections:,} edges)',
+					xy=(n_connections_80, 0.8), 
+					xytext=(n_connections_80 * 5, 0.5),
+					arrowprops=dict(arrowstyle='->', color='black', alpha=0.8,
+								connectionstyle="arc3,rad=-0.1"),
+					bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.9),
+					ha='left', va='center', fontsize=10, fontweight='bold')
+		
+		# Overall styling
+		plt.tight_layout()
+		plt.subplots_adjust(top=0.90)
+		# fig.suptitle('Global Iron Flow Network Characteristics: Structural Complexity vs. Functional Concentration', 
+		# 			fontsize=14, fontweight='bold', y=0.95)
+		
+		# Print key statistics for manuscript
+		print(f"\n=== KEY STATISTICS FOR MANUSCRIPT ===")
+		print(f"Total edges analyzed: {len(vals_physical):,}")
+		print(f"Flow size range: {vals_physical.min():.2e} to {vals_physical.max():.2e} tons")
+		print(f"Edges carrying 80% of mass: {n_connections_80:,} ({percent_connections:.1f}%)")
+		print(f"Mass concentration ratio: 1:{total_connections/n_connections_80:.0f}")
+		
+		return fig, {
+			'total_connections': len(vals_physical),
+			'connections_80_percent': n_connections_80,
+			'percent_connections': percent_connections,
+			'mass_concentration_ratio': total_connections / n_connections_80,
+			'flow_range': (vals_physical.min(), vals_physical.max())
+		}
 
+	# Flow Overlay Function
 	def compute_marginal_country_trade(self, out_path=None, verbose=False):
 		"""
 		Add estimated imports and exports to self.ds by comparing edge flows between different countries.
